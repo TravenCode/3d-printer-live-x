@@ -26,14 +26,14 @@ def listening(port):
         sock.settimeout(.3)
         return sock.connect_ex(('127.0.0.1', port)) == 0
 
-def ensure_server():
-    url = 'http://127.0.0.1:8080/'
-    if listening(8080):
+def ensure_server(port=8080):
+    url = f'http://127.0.0.1:{port}/'
+    if listening(port):
         with urllib.request.urlopen(url, timeout=3) as response:
             if 'AVATAR PRINT STUDIO' not in response.read(100000).decode('utf-8', errors='replace'):
-                raise RuntimeError('8080 端口被其他程序占用')
+                raise RuntimeError(f'{port} 端口被其他程序占用')
         return url, None
-    server = ThreadingHTTPServer(('127.0.0.1', 8080), partial(SimpleHTTPRequestHandler, directory=str(ROOT)))
+    server = ThreadingHTTPServer(('127.0.0.1', port), partial(SimpleHTTPRequestHandler, directory=str(ROOT)))
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return url, server
 
@@ -43,6 +43,144 @@ class DesktopApi:
         self._bridge = None
         self._room = None
         self._lock = threading.RLock()
+        self._window = None
+        self._live_restore = None
+        self._live_min = None
+        self._live_outer = None
+        self._url = None
+        self._live_window = None
+        self._live_size = None
+
+    def attach_window(self, window, url=None):
+        self._window = window
+        self._url = url or getattr(window, 'real_url', None)
+
+    def open_live_window(self):
+        """Open a second window that mirrors the print pipeline at 1080×1920.
+
+        The main window keeps running untouched, so controls stay usable while the
+        live window is what gets captured by OBS.
+        """
+        import webview
+        if self._live_window is not None:
+            try:
+                if self._live_window in webview.windows:
+                    self._live_window.restore()
+                    return '直播窗口已经打开，已切到前台'
+            except Exception:
+                pass
+            self._live_window = None
+        if not self._url:
+            return '页面地址不可用，无法打开直播窗口'
+        import ctypes
+        user32 = ctypes.windll.user32
+        screen_w = user32.GetSystemMetrics(0)
+        screen_h = user32.GetSystemMetrics(1)
+        height = min(1920, int(screen_h * 0.94))
+        width = round(height * 9 / 16)
+        if width > screen_w * 0.94:
+            width = int(screen_w * 0.94)
+            height = round(width * 16 / 9)
+        self._live_size = (width, height)
+        sep = '&' if '?' in self._url else '?'
+        self._live_window = webview.create_window(
+            '头像打印直播 · 1080×1920',
+            f'{self._url}{sep}live=1',
+            width=width, height=height,
+            x=max(0, (screen_w - width) // 2), y=max(0, (screen_h - height) // 2),
+            min_size=(320, 568),
+            background_color='#101318',
+        )
+        return f'已打开直播窗口 {width}×{height}（主窗口保留）'
+
+    def live_window_open(self):
+        """主窗口轮询用：直播窗口是否还开着（用户手动关掉后恢复主窗口渲染）。"""
+        import webview
+        try:
+            return bool(self._live_window is not None and self._live_window in webview.windows)
+        except Exception:
+            return False
+
+    def close_live_window(self):
+        if self._live_window is None:
+            return '直播窗口未打开'
+        try:
+            self._live_window.destroy()
+        except Exception:
+            pass
+        self._live_window = None
+        return '直播窗口已关闭'
+
+    def _release_min_size(self):
+        """WinForms clamps resizes to MinimumSize; lift it while the 9:16 frame is on."""
+        form = getattr(self._window, 'native', None)
+        if form is None:
+            return None
+        from System.Drawing import Size
+        saved = form.MinimumSize
+        form.MinimumSize = Size(1, 1)
+        return saved
+
+    def set_live_mode(self, on):
+        """Resize the desktop window to a 9:16 live frame and back again."""
+        window = self._window
+        if window is None:
+            return '桌面窗口不可用'
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        form = getattr(window, 'native', None)
+
+        if on:
+            if self._live_restore is None:
+                self._live_restore = (window.width, window.height, window.x, window.y)
+                self._live_min = self._release_min_size()
+                self._live_outer = None
+                if form is not None:
+                    try:
+                        r0 = wintypes.RECT()
+                        user32.GetWindowRect(int(form.Handle.ToInt32()), ctypes.byref(r0))
+                        self._live_outer = (r0.left, r0.top, r0.right - r0.left, r0.bottom - r0.top)
+                    except Exception:
+                        self._live_outer = None
+            screen_w = user32.GetSystemMetrics(0)
+            screen_h = user32.GetSystemMetrics(1)
+            # Title bar + borders: the 9:16 ratio has to apply to the client area,
+            # otherwise OBS captures a frame that is slightly off-ratio.
+            chrome_w = chrome_h = 0
+            scale = 1.0
+            if form is not None:
+                scale = getattr(form, '_scale', 1.0) or 1.0
+                try:
+                    hwnd = int(form.Handle.ToInt32())
+                    outer, client = wintypes.RECT(), wintypes.RECT()
+                    user32.GetWindowRect(hwnd, ctypes.byref(outer))
+                    user32.GetClientRect(hwnd, ctypes.byref(client))
+                    chrome_w = (outer.right - outer.left) - client.right
+                    chrome_h = (outer.bottom - outer.top) - client.bottom
+                except Exception:
+                    chrome_w = chrome_h = 0
+            avail_h = int(screen_h * 0.94) - chrome_h
+            height = min(1920, avail_h)
+            width = round(height * 9 / 16)
+            if width + chrome_w > screen_w * 0.94:
+                width = int(screen_w * 0.94) - chrome_w
+                height = round(width * 16 / 9)
+            window.resize(int(round((width + chrome_w) / scale)), int(round((height + chrome_h) / scale)))
+            window.move(max(0, (screen_w - width - chrome_w) // 2), max(0, (screen_h - height - chrome_h) // 2))
+            return f'直播竖屏 {width}×{height}（内容区）'
+
+        if self._live_restore:
+            width, height, x, y = self._live_restore
+            self._live_restore = None
+            try:
+                window.resize(width, height)
+                window.move(x, y)
+            finally:
+                if self._live_min is not None and form is not None:
+                    form.MinimumSize = self._live_min
+                    self._live_min = None
+        return '已恢复桌面窗口'
 
     def open_live_room(self, raw):
         with self._lock:
@@ -104,6 +242,7 @@ def main():
     parser.add_argument('--server-only', action='store_true')
     parser.add_argument('--room')
     parser.add_argument('--capture', action='store_true')
+    parser.add_argument('--port', type=int, default=8080, help='本地静态服务端口（默认 8080）')
     args = parser.parse_args()
     if args.live_room:
         import webview
@@ -112,15 +251,19 @@ def main():
         webview.create_window('直播间登录 · ' + room, 'https://live.douyin.com/' + room, width=1180, height=800)
         webview.start(gui='edgechromium', private_mode=False, storage_path=str(ROOT / '.live-webview-profile'))
         return
-    url, server = ensure_server()
+    url, server = ensure_server(args.port)
     api = DesktopApi()
     try:
         if args.server_only:
             threading.Event().wait()
         else:
             import webview
-            webview.create_window('头像打印机 · 桌面版', url, js_api=api, width=1380, height=860,
+            debug_port = os.environ.get('PRINTER_DEBUG_PORT')
+            if debug_port:
+                webview.settings['REMOTE_DEBUGGING_PORT'] = int(debug_port)
+            window = webview.create_window('头像打印机 · 桌面版', url, js_api=api, width=1380, height=860,
                 min_size=(900, 650), background_color='#0b0e14')
+            api.attach_window(window, url)
             def start_requested_room():
                 if not args.room:
                     return

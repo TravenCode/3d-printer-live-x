@@ -1,5 +1,15 @@
 import {test} from 'node:test';import assert from 'node:assert/strict';
-import {parseChatLine,mapGift,parseLike,diffNew,allocateLikes,normKey,pbDecode,extractUser,isJunkName} from './douyin-bridge.mjs';
+import {parseChatLine,mapGift,parseLike,diffNew,allocateLikes,normKey,pbDecode,extractUser,isJunkName,stripTimeSuffix} from './douyin-bridge.mjs';
+
+test('昵称后面的发布时间要被剥离',()=>{
+  assert.equal(stripTimeSuffix('yjg3250昨天 21'),'yjg3250');
+  assert.equal(stripTimeSuffix('小明'),'小明');
+  assert.equal(stripTimeSuffix('冰雨格格今天 08'),'冰雨格格');
+  assert.equal(stripTimeSuffix('路人甲3分钟前'),'路人甲');
+  assert.deepEqual(parseChatLine('yjg3250昨天 21：15哥 如何获取打印软件？'),{kind:'comment',name:'yjg3250',text:'哥 如何获取打印软件？'});
+  assert.deepEqual(parseChatLine('1072778353584052昨天 21：15哥 如何获取打印软件？'),{kind:'comment',name:'1072778353584052',text:'哥 如何获取打印软件？'});
+  assert.equal(parseChatLine('小明昨天 21：666').name,'小明');
+});
 
 test('评论解析',()=>{assert.deepEqual(parseChatLine('天观星系：打印了'),{kind:'comment',name:'天观星系',text:'打印了'});assert.deepEqual(parseChatLine('马达研究者：666'),{kind:'comment',name:'马达研究者',text:'666'})});
 test('礼物解析(空格形态)',()=>{const r=parseChatLine('蛋小黑 送出 大啤酒 x2');assert.equal(r.kind,'gift');assert.equal(r.name,'蛋小黑');assert.equal(r.gift,'大啤酒');assert.equal(r.count,2)});

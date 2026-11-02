@@ -21,13 +21,29 @@ const CHROME_CANDIDATES = [
 
 // —— 纯解析函数（供测试） ——
 
+// 弹幕行里昵称后面常紧跟发布时间（“昨天 21”“今天 08:30”“3分钟前”）。整行采集时
+// 这些文本会粘进昵称，导致按昵称精确匹配资料卡永远失败，头像只能退化成合成图。
+const TIME_SUFFIX = /(?:\s*(?:昨天|今天|前天|刚刚|刚才)\s*\d{0,2}(?:[:：]\d{1,2})?|\s*\d{1,2}\s*(?:秒|分钟|小时|天)前)\s*$/;
+export function stripTimeSuffix(name) {
+  let s = String(name || '');
+  for (let i = 0; i < 2; i++) {
+    const next = s.replace(TIME_SUFFIX, '').trim();
+    if (next === s || !next) break;
+    s = next;
+  }
+  return s;
+}
+
 export function parseChatLine(raw) {
-  const text = String(raw || '').replace(/\s+/g, ' ').trim();
+  let text = String(raw || '').replace(/\s+/g, ' ').trim();
   if (!text) return null;
   if (/欢迎来到直播间|严禁|未成年人|网络诈骗|理性消费|新功能|三屏|点击体验/.test(text) || /^(新功能|提示|公告|系统)\s*[：:]/.test(text)) return { kind: 'system', text };
+  // 昵称与分隔冒号之间夹着的发布时间（“yjg3250昨天 21：15…”“…今天 08:30：…”）先摘掉，
+  // 否则冒号会切在时间里，昵称带脏后缀、正文也少一截。
+  text = text.replace(/^(.{1,24}?)\s*(?:昨天|今天|前天|刚刚|刚才)\s*\d{0,2}\s*[：:]\s*\d{1,2}\s*(.*)$/, '$1：$2');
   let m = text.match(/^(.{1,24}?)\s*[：:]\s*(.*)$/);
   if (m) {
-    const name = m[1].trim(), body = m[2].trim();
+    const name = stripTimeSuffix(m[1]), body = m[2].trim();
     if (!name || isJunkName(name)) return null;
     const g = body.match(/^(?:送出|送了|送给主播)了?\s*(.+?)(?:\s*[xX×]\s*(\d{1,3}))?$/);
     if (g && g[1].trim()) return { kind: 'gift', name, gift: g[1].trim(), count: g[2] ? +g[2] : 1 };
@@ -36,11 +52,11 @@ export function parseChatLine(raw) {
     return { kind: 'comment', name, text: body };
   }
   m = text.match(/^(.{1,24}?)\s*(?:送出|送了|送给主播)了?\s*(.+?)(?:\s*[xX×]\s*(\d{1,3}))?$/);
-  if (m && m[2].trim() && !isJunkName(m[1].trim())) return { kind: 'gift', name: m[1].trim(), gift: m[2].trim(), count: m[3] ? +m[3] : 1 };
+  if (m && m[2].trim() && !isJunkName(stripTimeSuffix(m[1]))) return { kind: 'gift', name: stripTimeSuffix(m[1]), gift: m[2].trim(), count: m[3] ? +m[3] : 1 };
   m = text.match(/^(.{1,20}?)\s*来了$/);
-  if (m) return { kind: 'join', name: m[1].trim() };
+  if (m) return { kind: 'join', name: stripTimeSuffix(m[1]) };
   m = text.match(/^(.{1,24}?)\s*(?:关注了主播|关注了直播间|成为新粉丝|推荐了直播)/);
-  if (m) return { kind: 'follow', name: m[1].trim() };
+  if (m) return { kind: 'follow', name: stripTimeSuffix(m[1]) };
   return null;
 }
 
@@ -59,7 +75,9 @@ export function isJunkName(n) {
   if (s.length < 1 || s.length > 24) return true;
   if (/^(送出了?|送了|来了|关注|粉丝|评论|分享|关注了.*)$/.test(s)) return true;
   if (/分享\[视频\]|前天分享|小时榜|人气榜|本场点赞|在线观众|贡献/.test(s)) return true;
-  if (!/[\u{4e00}-\u{9fff}a-zA-Z]/u.test(s)) return true;
+  // 纯数字昵称（默认 ID 名，如 1072778353584052）是真实观众，不能当垃圾名丢掉；
+  // 太短的数字串仍按噪声处理。
+  if (!/[\u{4e00}-\u{9fff}a-zA-Z]/u.test(s) && !/^\d{6,20}$/.test(s)) return true;
   return false;
 }
 
@@ -142,13 +160,61 @@ function handleWSFrame(buf) {
       const user = extractUser(best.buf);
       if (!user || !user.name) continue;
       feedAvatar(user.name, user.avatar);
-      const type = kind === 'Chat' ? null : kind === 'Like' ? 'like' : kind === 'Social' ? 'follow' : kind === 'Member' ? 'join' : null;
+      if (kind === 'Chat') {
+        // 直播网页版不一定会把弹幕渲染进 DOM（聊天列表常常是空的），
+        // 只靠 DOM 抓会让「弹幕数」永远停在 1。这里直接从协议帧取正文。
+        const text = chatText(f.buf);
+        if (text) emitChat(user, text);
+        continue;
+      }
+      const type = kind === 'Like' ? 'like' : kind === 'Social' ? 'follow' : kind === 'Member' ? 'join' : null;
       if (type === 'like') emitLike(user);
       else if (type === 'follow') emitFollow(user);
       else if (type === 'join') emitJoinWS(user);
     }
   } catch { }
 }
+
+// WebcastChatMessage 的正文在字段 3（Content），个别版本在 2 或 5。
+function chatText(buf, depth = 0) {
+  if (depth > 4) return '';
+  let fields;
+  try { fields = pbDecode(buf) } catch { return '' }
+  for (const n of [3, 2, 5]) {
+    const f = fields.find(x => x.n === n && x.wire === 2 && x.buf && x.buf.length >= 1 && x.buf.length <= 300);
+    if (!f) continue;
+    const s = f.buf.toString('utf8').replace(/\s+/g, ' ').trim();
+    if (!s || /[\x00-\x08\x0b-\x1f�]/.test(s)) continue;
+    if (/Webcast\w*Message|^https?:\/\//.test(s)) continue;
+    return s;
+  }
+  for (const f of fields) {
+    if (f.wire !== 2 || !f.buf?.length || f.buf.length > 300) continue;
+    const nested = chatText(f.buf, depth + 1);
+    if (nested) return nested;
+  }
+  return '';
+}
+
+// 同一句弹幕 DOM 和协议层可能都报一次，这里用「昵称+正文」在 8 秒内去重。
+const recentChat = new Map();
+function emitChat(user, text) {
+  const key = user.name + '\u0000' + text;
+  const now = Date.now();
+  if (recentChat.get(key) && now - recentChat.get(key) < 8000) return;
+  recentChat.set(key, now);
+  if (recentChat.size > 300) { for (const [k, t] of recentChat) if (now - t > 30000) recentChat.delete(k) }
+  total.comment++;
+  lastEventAt = now;
+  broadcast({ type: 'comment', name: user.name, text, avatar: user.avatar || '' });
+  console.log('[' + stamp() + '] 💬 %s：%s（协议级）', user.name, text);
+}
+
+// 模块级事件出口：emitChat/emitLike/emitFollow/emitJoinWS 都在这里广播。
+// 早前它们直接引用 main() 里的局部 hub，协议级事件实际上每次都在抛
+// ReferenceError 然后被上层 catch 吞掉——点赞、关注、进场、协议层弹幕一条都发不出去。
+let hub = null;
+function broadcast(ev) { if (hub) hub.broadcast(ev) }
 
 const normMap = new Map();
 function feedAvatar(name, avatar) {
@@ -176,7 +242,7 @@ function emitLike(user) {
   }
   total.like += allowed;
   lastEventAt = nowMs;
-  hub.broadcast({ type: 'like', name: user.name, avatar: user.avatar || '', count: allowed });
+  broadcast({ type: 'like', name: user.name, avatar: user.avatar || '', count: allowed });
   console.log('[' + stamp() + '] ❤️ %s 点赞 +%d（协议级）', user.name, allowed);
 }
 
@@ -184,7 +250,7 @@ function emitFollow(user) {
   if (!user || !user.name) return;
   total.join++;
   lastEventAt = Date.now();
-  hub.broadcast({ type: 'follow', name: user.name, avatar: user.avatar || '' });
+  broadcast({ type: 'follow', name: user.name, avatar: user.avatar || '' });
   console.log('[' + stamp() + '] ⭐ %s 关注了直播间 → 打印头像', user.name);
 }
 
@@ -193,7 +259,7 @@ function emitJoinWS(user) {
   lastWsJoinAt = Date.now();
   total.join++;
   lastEventAt = Date.now();
-  hub.broadcast({ type: 'join', name: user.name, avatar: user.avatar || '' });
+  broadcast({ type: 'join', name: user.name, avatar: user.avatar || '' });
   console.log('[' + stamp() + '] 👋 %s 进入直播间（协议级）', user.name);
 }
 
@@ -205,16 +271,23 @@ export function parseLike(text) {
   return Math.round(v * (m[2] ? 10000 : 1));
 }
 
-// 从弹幕行列表里找出新行：从末尾向前扫到已见签名即停；签名缓冲防重复。
+// 从弹幕行列表里找出新行。按「位置重叠」比对而不是按文本查重：
+// 同一个人重复发「666」时文本完全相同，按文本去重会把第二次、第三次全部当成旧消息丢掉。
+// 弹幕列表是向下追加的滚动窗口，所以只需找「上一屏的末尾 == 这一屏的开头」的最大重叠段。
 export function diffNew(lines, seen, cap = 80) {
-  const fresh = [];
-  for (let i = lines.length - 1; i >= 0 && fresh.length < cap; i--) {
-    if (seen.has(lines[i])) break;
-    fresh.unshift(lines[i]);
+  const prev = seen.__prev;
+  seen.__prev = lines.slice();
+  if (!prev || !prev.length) return lines.slice(0, cap);
+  const max = Math.min(prev.length, lines.length);
+  let overlap = 0;
+  for (let i = max; i > 0; i--) {
+    let same = true;
+    for (let j = 0; j < i; j++) {
+      if (prev[prev.length - i + j] !== lines[j]) { same = false; break; }
+    }
+    if (same) { overlap = i; break; }
   }
-  for (const sig of fresh) seen.add(sig);
-  while (seen.size > 600) seen.delete(seen.values().next().value);
-  return fresh;
+  return lines.slice(overlap, overlap + cap);
 }
 
 // 点赞无法从页面获知点赞人：在累积观众花名册上公平轮换，同一人最多连续 cap 次，
@@ -262,10 +335,22 @@ const COLLECT = String.raw`(() => {
   const tick = (window.__scanTick = (window.__scanTick || 0) + 1);
   if (tick % 4 === 1 || !window.__chatRoot || !window.__chatRoot.isConnected) {
     let best = null, bestN = 0;
-    for (const c of document.querySelectorAll('div')) {
-      let n = 0;
-      for (const k of c.children) { const t = (k.innerText || '').replace(/\s+/g, ' ').trim(); if (t && t.length <= 90 && single(t)) n++; }
-      if (n > bestN) { bestN = n; best = c; }
+    // 优先用直播自带聊天室容器：它的类名是稳定的 webcast-chatroom。
+    // 早先纯按「子节点像不像弹幕」打分，会误选到私信/通知面板（"陌生人消息""xx分钟前分享[直播]"），
+    // 于是弹幕数、观众数都跟直播间对不上。
+    const room = document.querySelector('.webcast-chatroom');
+    const roomList = room && room.firstElementChild && room.firstElementChild.children.length ? room.firstElementChild : room;
+    // 只要聊天室容器在，就只用它，绝不回退到其它面板——
+    // 回退会抓到私信/通知列表（"陌生人消息""xx分钟前分享[直播]"），
+    // 让弹幕数和观众数完全对不上真实直播间。
+    if (roomList && roomList.children.length) { best = roomList; bestN = roomList.children.length; }
+    if (!best) {
+      for (const c of document.querySelectorAll('div')) {
+        if (c.closest('.webcast-chatroom, [class*="conversation"], [class*="Conversation"]')) continue;
+        let n = 0;
+        for (const k of c.children) { const t = (k.innerText || '').replace(/\s+/g, ' ').trim(); if (t && t.length <= 90 && single(t)) n++; }
+        if (n > bestN) { bestN = n; best = c; }
+      }
     }
     window.__chatRoot = best;
   }
@@ -308,9 +393,43 @@ const COLLECT = String.raw`(() => {
     window.__avMap = av;
   }
   Object.assign(out.avatars, window.__avMap || {});
-  if (tick % 40 === 7) {
-    const hdr = [...document.querySelectorAll('div,span')].find(e => /在线观众/.test(e.textContent || '') && (e.textContent || '').length < 30);
-    if (hdr) { for (const ty of ['mousedown', 'mouseup', 'click']) { try { hdr.dispatchEvent(new MouseEvent(ty, { bubbles: true, cancelable: true })) } catch (e) { } } }
+  // 在线观众名单：弹幕列表只显示最近几条，光靠它算观众数会严重偏少。
+  // 这里从「在线观众」面板逐行取昵称 + 头像，补进同一份 avatars 映射。
+  {
+    const hdr = [...document.querySelectorAll('div,span')].find(e => /在线观众/.test((e.textContent || '').slice(0, 20)) && (e.textContent || '').length < 40);
+    let panel = null;
+    if (hdr) {
+      let n = hdr;
+      for (let i = 0; i < 8 && n; i++, n = n.parentElement) {
+        const r = n.getBoundingClientRect();
+        if (r.height > 150 && n.querySelectorAll('img').length >= 2) { panel = n; break; }
+      }
+    }
+    if (panel) {
+      for (const img of panel.querySelectorAll('img')) {
+        const src = img.currentSrc || img.src || '';
+        if (!/douyinpic|byteimg/.test(src) || /grade_level|badge|medal|icon|ranklist|new_user_grade/i.test(src)) continue;
+        const r = img.getBoundingClientRect();
+        if (r.width < 18 || r.width > 60) continue;
+        let n = img.parentElement, name = '';
+        for (let i = 0; i < 4 && n && !name; i++, n = n.parentElement) {
+          const lines = (n.innerText || '').split('\n').map(s => s.trim()).filter(Boolean);
+          const cand = lines.find(t => t !== '-' && !/^\d+(钻|万)?$/.test(t) && !/^加入了直播间$/.test(t) && t.length >= 1 && t.length <= 20 && !/在线观众|全部|贡献用户|高等级|加入了/.test(t));
+          if (cand) { name = cand.replace(/^-\s*/, '').trim(); break }
+        }
+        if (name && !(window.__avMap || {})[name]) { window.__avMap = window.__avMap || {}; window.__avMap[name] = src }
+        if (name) { out.viewers = out.viewers || []; if (out.viewers.length < 60 && !out.viewers.some(v => v.name === name)) out.viewers.push({ name, avatar: src }) }
+      }
+      Object.assign(out.avatars, window.__avMap || {});
+    }
+  }
+  // 在线观众面板**不能**自动点开：它是一层覆盖在聊天室上面的抽屉，
+  // 打开后弹幕列表就不再渲染新消息（日志里「弹幕永远只有 1 条」就是它造成的）。
+  // 这里只读标题上的数字（"在线观众 · 5"），需要抓头像时才由下面 viewer 逻辑就地读取。
+  {
+    const hdr = [...document.querySelectorAll('div,span')].find(e => /在线观众/.test((e.innerText || '').slice(0, 20)) && (e.innerText || '').length < 40);
+    const m = hdr && (hdr.innerText || '').match(/在线观众[\s\S]{0,4}?(\d{1,6})/);
+    if (m) out.viewerCount = Number(m[1]);
   }
   if (tick % 8 === 0) {
     for (const d of document.querySelectorAll('div')) {
@@ -435,7 +554,7 @@ function attachCDP(target) {
 let currentRoom = '';
 let cdpRef = null;
 export function _injectCdpForTest(ref) { cdpRef = ref; }
-let lastLikes = null, clientCount = 0, chatSeen = false, owner = '';
+let lastLikes = null, clientCount = 0, chatSeen = false, owner = '', liveViewerCount = 0;
 const roster = new Map(), likeState = { idx: 0, used: new Map() }, lastSeen = new Map();
 const seen = new Set(), avatars = {};
 const total = { comment: 0, gift: 0, like: 0, join: 0 };
@@ -443,7 +562,7 @@ let likeTokens = 20, likeTokensAt = Date.now(), lastThrottleLog = 0, lastEventAt
 
 function resetRoomState() {
   lastLikes = null; chatSeen = false; owner = '';
-  roster.clear(); lastSeen.clear(); seen.clear();
+  roster.clear(); lastSeen.clear(); seen.clear(); seen.__prev = null;
   for (const k of Object.keys(avatars)) delete avatars[k];
   likeState.used.clear(); likeState.idx = 0;
   total.comment = total.gift = total.like = total.join = 0;
@@ -485,7 +604,7 @@ async function pollFollowers() {
         const [name, avatar] = pool[i % pool.length];
         total.join++;
         lastEventAt = Date.now();
-        hub.broadcast({ type: 'follow', name, avatar: avatar || '' });
+        broadcast({ type: 'follow', name, avatar: avatar || '' });
         console.log('[' + stamp() + '] ⭐ 新关注（粉丝 ' + lastFollowerCount + '→' + fans + '）→ 打印 ' + name);
       }
     }
@@ -551,11 +670,13 @@ export async function resolveHoverBatch(names) {
           const name = ${JSON.stringify(name)};
           const scope = window.__chatRoot;
           if (!scope || !scope.isConnected) return '[]';
+          const norm = s => (s || '').replace(/[\\s\\u3000]+/g, '');
+          const key = norm(name);
           const els = [...scope.querySelectorAll('span,a,div')].filter(e => {
             if (e.closest?.('[role="dialog"],dialog,a[href],button')) return false;
             const text = (e.textContent || '').trim();
             const r = e.getBoundingClientRect();
-            const matches = text === name || text === name + '：' || text === name + ':' || (!e.children.length && (text.startsWith(name + '：') || text.startsWith(name + ':')));
+            const matches = text === name || text === name + '：' || text === name + ':' || (!e.children.length && (text.startsWith(name + '：') || text.startsWith(name + ':'))) || norm(text) === key;
             return matches && r.width > 2 && r.height > 2 && r.top >= 0 && r.bottom <= innerHeight && r.left >= 0 && r.left < innerWidth;
           });
           const el = els[els.length - 1];
@@ -651,9 +772,19 @@ export async function resolveHoverBatch(names) {
 
 async function run(hub) {
   const room = currentRoom;
-  let found = await findTarget(room);
-  if (!found) {
-    if (process.env.PRINTER_CDP_PORT) throw new Error('独立直播窗口未就绪，请完成登录后重新开始抓取');
+  // CDP 端口只是「暂时」连不上（页面正在刷新、直播窗口刚重启、登录页跳转中）时，
+  // 绝不能直接抛错让整个数据桥进程退出——那样直播会静默断流。
+  // 这里最多重试 20 次（约 40 秒），期间持续打印状态。
+  let found = null;
+  for (let attempt = 1; attempt <= 20 && !found; attempt++) {
+    found = await findTarget(room);
+    if (found) break;
+    if (attempt === 1 || attempt % 5 === 0) {
+      console.log('[' + stamp() + '] ⏳ 暂未找到直播间页面（第 %d 次），2 秒后重试…', attempt);
+    }
+    await sleep(2000);
+  }
+  if (!found && !process.env.PRINTER_CDP_PORT) {
     await launchStandaloneChrome(room);
     found = await findTarget(room);
   }
@@ -697,16 +828,33 @@ async function run(hub) {
 
   function emit(ev) {
     lastEventAt = Date.now();
+    if (ev.type === 'comment') {
+      // 同一条弹幕可能同时来自 DOM 与协议层，8 秒内按「昵称+正文」去重，避免重复打印。
+      const key = ev.name + '\u0000' + (ev.text || '');
+      const now = Date.now();
+      const dup = recentChat.get(key) && now - recentChat.get(key) < 8000;
+      recentChat.set(key, now);
+      if (dup) return;
+    }
     hub.broadcast(ev);
-    if (ev.type === 'comment') { total.comment++; console.log('[' + stamp() + '] 💬 %s：%s', ev.name, ev.text || '') }
+    if (ev.type === 'comment') {
+      total.comment++;
+      console.log('[' + stamp() + '] 💬 %s：%s', ev.name, ev.text || '');
+    }
     else if (ev.type === 'gift') { total.gift++; console.log('[' + stamp() + '] 🎁 %s 送出 %s x%d → %s', ev.name, ev.raw, ev.count, ev.gift) }
     else if (ev.type === 'like') { total.like += ev.count; console.log('[' + stamp() + '] ❤️ %s 点赞 +%d%s', ev.name, ev.count, ev.avatar ? '（带头像）' : '') }
     else if (ev.type === 'join') { total.join++; console.log('[' + stamp() + '] 👋 %s 进入直播间', ev.name) }
   }
 
-  let commentResolution = Promise.resolve();
   function handle(s) {
     if (s.owner) owner = s.owner;
+    if (s.viewerCount > 0) liveViewerCount = s.viewerCount;
+    // 在线观众面板里的人是「到场观众」，即使还没发言也应该计入观众数。
+    for (const v of (s.viewers || [])) {
+      if (!v || !v.name || !v.avatar || v.name === owner || isJunkName(v.name)) continue;
+      if (!roster.has(v.name)) likeState.used.clear();
+      feedAvatar(v.name, v.avatar);
+    }
     for (const [n, a] of Object.entries(s.avatars || {})) {
       if (!a || !n || n === owner || isJunkName(n)) continue;
       if (!roster.has(n) && !(s.lines || []).some(line => parseChatLine(line)?.name === n)) continue;
@@ -747,17 +895,36 @@ async function run(hub) {
       lastSeen.set(ev.name, Date.now());
       if (ev.kind !== 'comment') parsedNames.push(ev.name);
       if (ev.kind === 'comment') {
-        // Preserve every comment, including repeated text; resolve its avatar before dispatch.
-        commentResolution = commentResolution.then(async () => {
-          if (room !== currentRoom) return;
-          if (!avatars[ev.name] && !avatar) await hoverResolveAvatars([ev.name]);
-          if (room !== currentRoom) return;
-          const resolved = avatars[ev.name] || (key && normMap.get(key)) || avatar;
-          emit({ type: 'comment', name: ev.name, text: ev.text, avatar: resolved || '' });
-        }).catch(err => console.error('评论头像补取失败：', err.message));
+        // 评论立刻发出：补取资料卡要串行点击、每轮最长约 4 秒，扣在这里会让「评论 666」
+        // 十几秒都不上屏。头像先用已知的，补取成功后由 avatar 事件回填给前端。
+        emit({ type: 'comment', name: ev.name, text: ev.text, avatar: (avatars[ev.name] || (key && normMap.get(key)) || avatar) || '' });
+        if (!avatars[ev.name] && !avatar) {
+          hoverResolveAvatars([ev.name]).then(() => {
+            if (room !== currentRoom) return;
+            const resolved = avatars[ev.name] || (key && normMap.get(key)) || '';
+            if (resolved) emit({ type: 'avatar', name: ev.name, avatar: resolved });
+          }).catch(err => console.error('评论头像补取失败：', err.message));
+        }
       }
-      else if (ev.kind === 'gift') emit({ type: 'gift', name: ev.name, gift: mapGift(ev.gift), raw: ev.gift, count: ev.count, avatar });
-      else if (ev.kind === 'follow') emit({ type: 'follow', name: ev.name, avatar });
+      else if (ev.kind === 'gift' || ev.kind === 'follow') {
+        const payload = ev.kind === 'gift'
+          ? { type: 'gift', name: ev.name, gift: mapGift(ev.gift), raw: ev.gift, count: ev.count }
+          : { type: 'follow', name: ev.name };
+        // 礼物/关注原先用「此刻已知的头像」直接广播，新观众第一次送礼时往往还是空串，
+        // 打印出来的就是合成头像。这里给它一个很短的补取窗口，至少不阻塞打印节奏。
+        const dispatch = () => {
+          if (room !== currentRoom) return;
+          const resolved = avatars[ev.name] || (key && normMap.get(key)) || normAvatars[key] || avatar;
+          emit({ ...payload, avatar: resolved || '' });
+        };
+        if (avatar) dispatch();
+        else {
+          let done = false;
+          const once = () => { if (done) return; done = true; clearTimeout(timer); dispatch(); };
+          const timer = setTimeout(once, 300);
+          hoverResolveAvatars([ev.name]).then(once, once);
+        }
+      }
       else if (ev.kind === 'join' && Date.now() - lastWsJoinAt > 30000) emit({ type: 'join', name: ev.name, avatar });
     }
     if (parsedNames.length) {
@@ -793,7 +960,7 @@ async function run(hub) {
       } else console.log('[' + stamp() + '] 打印页面断开（剩 %d 个）', n);
       clientCount = n;
     }
-    if (hub.clientCount()) hub.broadcast({ type: 'ping', room: currentRoom, ts: Date.now(), people: [...roster.entries()].sort((a, b) => Number(!!b[1]) - Number(!!a[1])).slice(0, 8).map(([name, avatar]) => ({ name, avatar })), stats: { comment: total.comment, like: total.like, gift: total.gift, join: total.join, lastAgo: lastEventAt ? Date.now() - lastEventAt : null, roster: roster.size } });
+    if (hub.clientCount()) hub.broadcast({ type: 'ping', room: currentRoom, ts: Date.now(), people: [...roster.entries()].sort((a, b) => Number(!!b[1]) - Number(!!a[1])).slice(0, 8).map(([name, avatar]) => ({ name, avatar })), stats: { comment: total.comment, like: total.like, gift: total.gift, join: total.join, lastAgo: lastEventAt ? Date.now() - lastEventAt : null, roster: roster.size, viewers: Math.max(roster.size, liveViewerCount) } });
   }, 2000);
   watch.unref?.();
 
@@ -814,7 +981,7 @@ async function main() {
   currentRoom = argRoom || fileRoom || currentRoom;
   if (!currentRoom) { console.error('请提供直播间号：node douyin-bridge.mjs 房间号（也可写入 .bridge-room 文件，或在打印程序里切换房间）'); process.exit(1); }
   const wsPort = Number(process.argv[3]) || 8765;
-  const hub = startWSServer(wsPort, {
+  hub = startWSServer(wsPort, {
     onStatus: p => console.log('[' + stamp() + '] ✅ 数据桥服务 ws://127.0.0.1:' + p + '（等待打印页面接入）'),
     onError: err => {
       console.error('[' + stamp() + '] ❌ 端口 ' + wsPort + ' 启动失败（' + err.code + '），可能有另一个数据桥在运行，本实例退出');
@@ -836,10 +1003,15 @@ async function main() {
     }
   });
   console.log('房间号 ' + currentRoom + '。正在弹出直播间窗口（可在里面登录抖音）；来源优先级：自建窗口(:9223) → BrowserOS(:9110) → 调试Chromium(:9222)');
-  try { await run(hub) } catch (e) {
-    console.error('[' + stamp() + '] ❌ ' + e.message);
-    console.error('提示：先打开 BrowserOS neo（会自动用 :9110），或重试本命令。');
-    process.exitCode = 1;
+  // 数据桥要长期驻留：连接失败只重试，不退出。不然窗口一刷新就会静默断流。
+  for (;;) {
+    try {
+      await run(hub);
+      break;
+    } catch (e) {
+      console.error('[' + stamp() + '] ❌ ' + e.message + '；8 秒后重试连接…');
+      await sleep(8000);
+    }
   }
   process.on('SIGINT', () => process.exit());
 }
